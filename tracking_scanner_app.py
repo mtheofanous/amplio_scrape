@@ -16,11 +16,49 @@ Run with:
 """
 
 import re
+import socket
+import ssl
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import pandas as pd
 import requests
+import subprocess
+import sys
+import time
+import threading
 import streamlit as st
+
+# Optional/extra packages (wrapped imports handled below)
+try:
+    import httpx
+except Exception:  # pragma: no cover - optional
+    httpx = None
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover - optional
+    BeautifulSoup = None
+try:
+    import dns.resolver
+except Exception:  # pragma: no cover - optional
+    dns = None
+try:
+    import whois as whois_lib
+except Exception:  # pragma: no cover - optional
+    whois_lib = None
+try:
+    import tldextract
+except Exception:  # pragma: no cover - optional
+    tldextract = None
+try:
+    from ipwhois import IPWhois
+except Exception:  # pragma: no cover - optional
+    IPWhois = None
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:  # pragma: no cover - optional
+    sync_playwright = None
 
 st.set_page_config(page_title="Tracking & Ad Platform Scanner", layout="wide")
 
@@ -30,6 +68,27 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 }
+
+OPTIONAL_NOTES = []
+if httpx is None:
+    OPTIONAL_NOTES.append("httpx missing: async/http2 features disabled")
+if BeautifulSoup is None:
+    OPTIONAL_NOTES.append("beautifulsoup4 missing: structured HTML parsing disabled")
+if dns is None:
+    OPTIONAL_NOTES.append("dnspython missing: DNS lookups disabled")
+if whois_lib is None:
+    OPTIONAL_NOTES.append("python-whois missing: WHOIS lookups disabled")
+if tldextract is None:
+    OPTIONAL_NOTES.append("tldextract missing: domain normalization degraded")
+if IPWhois is None:
+    OPTIONAL_NOTES.append("ipwhois missing: ASN lookup disabled")
+
+# Playwright concurrency controls (updated from UI)
+PLAYWRIGHT_ENABLED = False
+PLAYWRIGHT_WORKERS = 1
+PLAYWRIGHT_RETRIES = 2
+PLAYWRIGHT_TIMEOUT = 30
+PLAYWRIGHT_SEMAPHORE = threading.BoundedSemaphore(1)
 
 CMP_VENDORS = {
     "Cookiebot": ["cookiebot.com", "consent.cookiebot.com"],
@@ -73,6 +132,247 @@ def fetch_html(domain: str, timeout: int = 12):
         except Exception as e:  # noqa: BLE001
             last_err = str(e)
     return None, last_err
+
+
+def normalize_domain(domain: str) -> str:
+    d = domain.strip()
+    if d.startswith("http://") or d.startswith("https://"):
+        d = re.sub(r"^https?://", "", d)
+    d = d.split("/")[0]
+    if tldextract:
+        e = tldextract.extract(d)
+        if e.registered_domain:
+            return e.registered_domain
+    return d
+
+
+def resolve_dns(domain: str) -> dict:
+    out = {"A": [], "AAAA": [], "MX": [], "TXT": []}
+    if dns is None:
+        return {"error": "dnspython not installed"}
+    try:
+        answers = dns.resolver.resolve(domain, "A", lifetime=5)
+        out["A"] = [r.to_text() for r in answers]
+    except Exception:
+        pass
+    try:
+        answers = dns.resolver.resolve(domain, "AAAA", lifetime=5)
+        out["AAAA"] = [r.to_text() for r in answers]
+    except Exception:
+        pass
+    try:
+        answers = dns.resolver.resolve(domain, "MX", lifetime=5)
+        out["MX"] = [r.to_text() for r in answers]
+    except Exception:
+        pass
+    try:
+        answers = dns.resolver.resolve(domain, "TXT", lifetime=5)
+        out["TXT"] = [r.to_text().strip('"') for r in answers]
+    except Exception:
+        pass
+    return out
+
+
+def get_whois(domain: str) -> dict:
+    if whois_lib is None:
+        return {"error": "whois library not installed"}
+    try:
+        w = whois_lib.whois(domain)
+        return {k: v for k, v in w.items()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_ip_asn(domain: str) -> dict:
+    try:
+        host = domain
+        ips = []
+        for res in socket.getaddrinfo(host, None):
+            ips.append(res[4][0])
+        ips = list(dict.fromkeys(ips))
+        info = {"ips": ips}
+        if IPWhois and ips:
+            try:
+                obj = IPWhois(ips[0])
+                asn = obj.lookup_rdap(depth=1)
+                info["asn"] = asn.get("asn")
+                info["asn_country_code"] = asn.get("asn_country_code")
+                info["asn_description"] = asn.get("asn_description")
+            except Exception:
+                info["asn_error"] = "lookup failed"
+        return info
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_tls_info(domain: str) -> dict:
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+                return cert
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def extract_meta(html: str) -> dict:
+    if BeautifulSoup is None:
+        return {"error": "beautifulsoup4 not installed"}
+    soup = BeautifulSoup(html, "html.parser")
+    meta = {}
+    for tag in soup.find_all("meta"):
+        if tag.get("name"):
+            meta[tag.get("name")] = tag.get("content", "")
+        if tag.get("property"):
+            meta[tag.get("property")] = tag.get("content", "")
+    title = soup.title.string if soup.title else ""
+    return {"title": title, "meta": meta}
+
+
+def extract_structured_data(html: str) -> list:
+    if BeautifulSoup is None:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for s in soup.find_all("script", type="application/ld+json"):
+        try:
+            out.append(json.loads(s.string))
+        except Exception:
+            try:
+                out.append(json.loads(s.get_text()))
+            except Exception:
+                out.append({"raw": s.string})
+    return out
+
+
+def find_contacts(html: str) -> dict:
+    emails = set(re.findall(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}", html))
+    phones = set(re.findall(r"\+?[0-9][0-9()\-\s]{6,}[0-9]", html))
+    return {"emails": list(emails), "phones": list(phones)}
+
+
+def detect_technologies(html: str) -> list:
+    tech = []
+    low = html.lower()
+    if "wp-content" in low or "wordpress" in low:
+        tech.append("WordPress")
+    if "shopify" in low:
+        tech.append("Shopify")
+    if "woocommerce" in low:
+        tech.append("WooCommerce")
+    if "react" in low:
+        tech.append("React")
+    return tech
+
+
+def check_meta_ad_library(domain: str, token: str = None) -> dict:
+    # Requires a Meta Graph API token with ads_read permissions.
+    if not token:
+        return {"status": "not_configured", "note": "Provide META_ACCESS_TOKEN env var or token"}
+    url = "https://graph.facebook.com/v16.0/ads_archive"
+    params = {"access_token": token, "search_terms": domain}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        return {"status": "ok", "data": r.json()}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def check_google_ads_transparency(domain: str) -> dict:
+    if sync_playwright is None:
+        return {"status": "not_configured", "note": "playwright not installed"}
+
+    # Use semaphore so we don't spawn too many browsers in parallel
+    acquired = PLAYWRIGHT_SEMAPHORE.acquire(timeout=PLAYWRIGHT_TIMEOUT)
+    if not acquired:
+        return {"status": "error", "error": "could not acquire Playwright semaphore"}
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            url = "https://transparencyreport.google.com/political-ads/advertiser"
+            page.goto(url, timeout=int(PLAYWRIGHT_TIMEOUT * 1000))
+
+            # robust search input detection
+            input_selectors = [
+                'input[type="search"]',
+                'input[aria-label*="Search"]',
+                'input[placeholder*="Search"]',
+                'input[aria-label*="Advertiser"]',
+                'input[name*="q"]',
+            ]
+            searched = False
+            for sel in input_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        el.fill(domain)
+                        el.press("Enter")
+                        searched = True
+                        break
+                except Exception:
+                    continue
+
+            # try click search button as fallback
+            if not searched:
+                try:
+                    btn = page.query_selector('button[aria-label*="Search"]') or page.query_selector('button[type="submit"]')
+                    if btn:
+                        btn.click()
+                        searched = True
+                except Exception:
+                    searched = False
+
+            # wait for result cards or for some visible change
+            try:
+                page.wait_for_selector("div[role='article']", timeout=int(PLAYWRIGHT_TIMEOUT * 1000))
+            except Exception:
+                # fallback wait a short while
+                page.wait_for_timeout(3000)
+
+            content = page.content()
+            found = domain.lower() in content.lower()
+
+            snippets = []
+            try:
+                cards = page.query_selector_all("div[role='article']")
+                if not cards:
+                    # alternative card selectors
+                    cards = page.query_selector_all("div.card, div.result, div.c-card")
+                for c in cards[:8]:
+                    try:
+                        txt = c.inner_text()
+                        snippets.append(txt[:2000])
+                    except Exception:
+                        try:
+                            snippets.append(c.text_content()[:2000])
+                        except Exception:
+                            snippets.append("")
+            except Exception:
+                pass
+
+            browser.close()
+            return {"status": "ok", "found": found, "snippets": snippets, "raw_excerpt": content[:8000]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        try:
+            PLAYWRIGHT_SEMAPHORE.release()
+        except Exception:
+            pass
+
+
+def retry_playwright_check(domain: str, attempts: int = 2, delay: int = 2) -> dict:
+    last = None
+    for i in range(attempts):
+        res = check_google_ads_transparency(domain)
+        if res.get("status") == "ok" and (res.get("found") or res.get("snippets")):
+            return res
+        last = res
+        time.sleep(delay)
+    return last or {"status": "error", "error": "no result"}
 
 
 def analyze_html(html: str) -> dict:
@@ -155,15 +455,63 @@ def analyze_html(html: str) -> dict:
 
 
 def scan_domain(domain: str) -> dict:
+    norm = normalize_domain(domain)
     html, err = fetch_html(domain)
-    row = {"Domain": domain}
+    row = {"Domain": norm}
     if err:
         row["Status"] = "Error"
         row["Error"] = err
         return row
     row["Status"] = "OK"
     row["Error"] = ""
+
+    # existing HTML analysis
     row.update(analyze_html(html))
+
+    # expanded reconnaissance
+    try:
+        row["DNS"] = resolve_dns(norm)
+    except Exception as e:
+        row["DNS"] = {"error": str(e)}
+    try:
+        row["WHOIS"] = get_whois(norm)
+    except Exception as e:
+        row["WHOIS"] = {"error": str(e)}
+    try:
+        row["IP_ASN"] = get_ip_asn(norm)
+    except Exception as e:
+        row["IP_ASN"] = {"error": str(e)}
+    try:
+        row["TLS"] = get_tls_info(norm)
+    except Exception as e:
+        row["TLS"] = {"error": str(e)}
+
+    # page parsing
+    try:
+        row["PageMeta"] = extract_meta(html)
+        row["StructuredData"] = extract_structured_data(html)
+        row["Contacts"] = find_contacts(html)
+        row["Technologies"] = detect_technologies(html)
+    except Exception as e:
+        row["ParseError"] = str(e)
+
+    # ad/transparency checks (optional tokens)
+    meta_token = None
+    try:
+        meta_token = st.secrets.get("META_ACCESS_TOKEN") if hasattr(st, "secrets") else None
+    except Exception:
+        meta_token = None
+    row["MetaAdLibrary"] = check_meta_ad_library(norm, token=meta_token)
+    if PLAYWRIGHT_ENABLED:
+        # use retry wrapper which itself calls the semaphore-protected check
+        row["GoogleAdsTransparency"] = retry_playwright_check(norm, attempts=int(PLAYWRIGHT_RETRIES), delay=2)
+    else:
+        row["GoogleAdsTransparency"] = {"status": "disabled"}
+
+    if OPTIONAL_NOTES:
+        row["OptionalNotes"] = OPTIONAL_NOTES
+
+    row["ScannedAt"] = datetime.utcnow().isoformat() + "Z"
     return row
 
 
@@ -174,6 +522,27 @@ st.caption(
     "Detects GTM, GA4, CMP, Consent Mode v2, Meta Pixel and Google Ads tags directly from a "
     "site's public HTML — the same signals used in the Amplio Account Master."
 )
+
+# Sidebar controls for Playwright headless checks
+with st.sidebar.expander("Headless checks (Playwright)", expanded=False):
+    PLAYWRIGHT_ENABLED = st.checkbox("Enable Google Ads Transparency checks (Playwright)", value=False)
+    PLAYWRIGHT_WORKERS = st.slider("Playwright workers", 1, 4, value=1)
+    PLAYWRIGHT_RETRIES = st.number_input("Playwright retries", min_value=0, max_value=5, value=2)
+    PLAYWRIGHT_TIMEOUT = st.number_input("Playwright timeout (s)", min_value=5, max_value=120, value=30)
+    if st.button("Install Playwright browsers"):
+        with st.spinner("Installing Playwright browsers (this may take a minute)..."):
+            try:
+                # run playwright install in the venv python
+                subprocess.check_call([sys.executable, "-m", "playwright", "install"], shell=False)
+                st.success("Playwright browsers installed")
+            except Exception as e:
+                st.error(f"Playwright install failed: {e}")
+
+    # update semaphore size based on workers
+    try:
+        PLAYWRIGHT_SEMAPHORE = threading.BoundedSemaphore(int(PLAYWRIGHT_WORKERS))
+    except Exception:
+        PLAYWRIGHT_SEMAPHORE = threading.BoundedSemaphore(1)
 
 with st.expander("⚠️ How this works / limitations", expanded=False):
     st.markdown(
