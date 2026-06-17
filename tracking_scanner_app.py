@@ -246,6 +246,44 @@ def extract_structured_data(html: str) -> list:
     return out
 
 
+def sanitize_row_for_display(row: dict) -> dict:
+    """Convert nested structures to JSON strings so Streamlit/pyarrow can display/export them."""
+    clean = {}
+    for k, v in row.items():
+        if v is None:
+            clean[k] = ""
+            continue
+        # primitives
+        if isinstance(v, (str, int, float, bool)):
+            clean[k] = v
+            continue
+        # Pandas / datetime handling
+        try:
+            # pandas types and datetime
+            import pandas as _pd
+
+            if _pd is not None and isinstance(v, (_pd.Timestamp,)):
+                clean[k] = str(v)
+                continue
+        except Exception:
+            pass
+
+        # dicts, lists, sets, tuples -> JSON string
+        try:
+            if isinstance(v, (dict, list, set, tuple)):
+                clean[k] = json.dumps(v, default=str, ensure_ascii=False)
+                continue
+        except Exception:
+            pass
+
+        # fallback to string
+        try:
+            clean[k] = str(v)
+        except Exception:
+            clean[k] = ""
+    return clean
+
+
 def find_contacts(html: str) -> dict:
     emails = set(re.findall(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}", html))
     phones = set(re.findall(r"\+?[0-9][0-9()\-\s]{6,}[0-9]", html))
@@ -572,7 +610,7 @@ with tab1:
             st.error(f"Could not fetch {domain_input}: {row.get('Error')}")
         else:
             st.success(f"Scanned {domain_input}")
-            st.dataframe(pd.DataFrame([row]), use_container_width=True)
+            st.dataframe(pd.DataFrame([sanitize_row_for_display(row)]), use_container_width=True)
 
 with tab2:
     st.write("Paste one domain per line, or upload a CSV/Excel file with a `Domain` / `Website` column.")
@@ -616,6 +654,10 @@ with tab2:
         order = {d: i for i, d in enumerate(domains)}
         results.sort(key=lambda r: order[r["Domain"]])
         df = pd.DataFrame(results)
+
+        # sanitize nested fields for display/export
+        display_rows = [sanitize_row_for_display(r) for r in results]
+        df = pd.DataFrame(display_rows)
 
         st.success(f"Done — scanned {len(df)} domains.")
         st.dataframe(df, use_container_width=True)
