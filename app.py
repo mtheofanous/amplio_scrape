@@ -1,4 +1,7 @@
 import asyncio
+import subprocess
+import sys
+
 import pandas as pd
 import streamlit as st
 from scraper.browser import scrape_domains
@@ -10,6 +13,25 @@ st.set_page_config(
     page_icon="🔍",
     layout="wide",
 )
+
+
+@st.cache_resource(show_spinner="Setting up the headless browser…")
+def _ensure_chromium() -> bool:
+    """Streamlit Cloud builds a fresh container that never runs `playwright install`,
+    so the Chromium binary is missing. Download it once per app boot (idempotent —
+    a no-op locally where it's already installed). System libs come from packages.txt."""
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True, capture_output=True, text=True, timeout=300,
+        )
+        return True
+    except Exception as exc:  # surface but don't crash the whole app on import
+        st.warning(f"Could not auto-install Chromium: {exc}")
+        return False
+
+
+_ensure_chromium()
 
 st.title("🔍 Domain Tag Scraper")
 st.caption("Detects GTM · GA4 · CMP · Consent Mode · Ad Platforms")
