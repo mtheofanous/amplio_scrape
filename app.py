@@ -62,8 +62,16 @@ with col2:
         help="Looks up DNS records, WHOIS, hosting ASN and TLS cert. Surfaces signals like a "
              "facebook-domain-verification TXT record even when the Pixel is hidden.",
     )
+    concurrency = st.slider(
+        "Parallel browsers", 1, 4, 2,
+        help="How many sites to scan at once. Each one runs a headless Chromium tab — "
+             "keep this low (1–2) on memory-limited hosts like Streamlit Cloud to avoid crashes.",
+    )
 
 run = st.button("🚀 Start Scraping", type="primary", use_container_width=True)
+
+# Cap per run so a huge paste can't exhaust memory (esp. on Streamlit Cloud's ~1 GB).
+MAX_DOMAINS = 25
 
 # ── Parse domains ─────────────────────────────────────────────────────────────
 def parse_domains(raw: str) -> list[str]:
@@ -119,6 +127,12 @@ def _recon_columns(recon: dict) -> dict:
 # ── Main execution ────────────────────────────────────────────────────────────
 if run:
     domains = parse_domains(raw_input)
+    if len(domains) > MAX_DOMAINS:
+        st.warning(
+            f"You entered {len(domains)} domains — scanning only the first {MAX_DOMAINS} "
+            f"to stay within memory limits. Run the rest in another batch."
+        )
+        domains = domains[:MAX_DOMAINS]
     if not domains:
         st.warning("Please enter at least one domain.")
     else:
@@ -129,9 +143,11 @@ if run:
         results: list[ScrapeResult] = []
 
         async def run_with_progress():
-            async for i, result in scrape_domains(domains, timeout=timeout, wait_for=wait_for, accept_consent=accept_consent, do_recon=do_recon):
+            done = 0
+            async for i, result in scrape_domains(domains, timeout=timeout, wait_for=wait_for, accept_consent=accept_consent, do_recon=do_recon, concurrency=concurrency):
                 results.append(result)
-                progress.progress((i + 1) / len(domains))
+                done += 1
+                progress.progress(done / len(domains))
                 status.text(f"✔ {result.domain}")
                 results_placeholder.dataframe(results_to_df(results), use_container_width=True)
 
